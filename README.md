@@ -1,6 +1,8 @@
 # FileClassify
 
-一个基于 PyQt6 的 Windows 文件分类工具。
+使用千问3b对选中文件夹中文件进行分类，懒人必备
+
+一个基于 PySide6 的 Windows 文件分类工具。
 
 ## 安装
 
