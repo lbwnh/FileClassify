@@ -3,17 +3,94 @@ import os
 from pathlib import Path
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                 QHBoxLayout, QPushButton, QLineEdit, QFileDialog,
-                                QTreeView, QSplitter, QLabel, QStatusBar, QStackedWidget,
-                                QFileSystemModel, QTextEdit)
+                                QTreeWidget, QTreeWidgetItem, QSplitter, QLabel, 
+                                QStatusBar, QStackedWidget, QTextEdit, QProgressBar)
 from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QIcon
+
+WHITELIST_EXTENSIONS = {'.pdf', '.docx', '.xlsx', '.pptx', '.txt', '.md'}
+
+
+class TreeLoaderWorker(QThread):
+    data_ready = Signal(list)
+    
+    def __init__(self, root_path, whitelist_extensions):
+        super().__init__()
+        self.root_path = root_path
+        self.whitelist_extensions = whitelist_extensions
+        self._is_running = True
+    
+    def run(self):
+        try:
+            data = self.scan_directory(Path(self.root_path))
+            if self._is_running:
+                self.data_ready.emit(data)
+        except Exception as e:
+            print(f"Error in TreeLoaderWorker: {e}")
+            if self._is_running:
+                self.data_ready.emit([])
+    
+    def scan_directory(self, path):
+        items = []
+        
+        try:
+            for item in sorted(path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+                if not self._is_running:
+                    return items
+                
+                if item.is_file():
+                    if item.suffix.lower() in self.whitelist_extensions:
+                        try:
+                            size = item.stat().st_size
+                            items.append({
+                                'name': item.name,
+                                'type': 'file',
+                                'path': str(item),
+                                'extension': item.suffix.upper(),
+                                'size': size
+                            })
+                        except:
+                            pass
+                
+                elif item.is_dir():
+                    if self.has_valid_files(item):
+                        children = self.scan_directory(item)
+                        if children or self.has_valid_files(item):
+                            items.append({
+                                'name': item.name,
+                                'type': 'dir',
+                                'path': str(item),
+                                'children': children
+                            })
+        except Exception as e:
+            pass
+        
+        return items
+    
+    def has_valid_files(self, folder_path):
+        try:
+            for root, dirs, files in os.walk(folder_path):
+                if not self._is_running:
+                    return False
+                for file in files:
+                    file_path = Path(root) / file
+                    if file_path.suffix.lower() in self.whitelist_extensions:
+                        return True
+            return False
+        except Exception as e:
+            return False
+    
+    def stop(self):
+        self._is_running = False
 
 
 class FileCounterThread(QThread):
     count_finished = Signal(int, int)
     
-    def __init__(self, folder_path):
+    def __init__(self, folder_path, whitelist_extensions):
         super().__init__()
         self.folder_path = folder_path
+        self.whitelist_extensions = whitelist_extensions
         self._is_running = True
     
     def run(self):
@@ -28,7 +105,8 @@ class FileCounterThread(QThread):
                 if item.is_dir():
                     folder_count += 1
                 elif item.is_file():
-                    file_count += 1
+                    if item.suffix.lower() in self.whitelist_extensions:
+                        file_count += 1
         except Exception as e:
             pass
         
@@ -47,6 +125,7 @@ class MainWindow(QMainWindow):
         
         self.current_folder = None
         self.counter_thread = None
+        self.loader_worker = None
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -112,12 +191,25 @@ class MainWindow(QMainWindow):
         active_layout = QVBoxLayout(active_state_widget)
         active_layout.setContentsMargins(0, 0, 0, 0)
         
-        self.file_tree = QTreeView()
-        self.file_model = QFileSystemModel()
-        self.file_model.setRootPath("")
-        self.file_tree.setModel(self.file_model)
-        self.file_tree.setColumnWidth(0, 250)
+        self.loading_widget = QWidget()
+        loading_layout = QVBoxLayout(self.loading_widget)
+        loading_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        loading_label = QLabel("正在扫描文件...")
+        loading_label.setStyleSheet("font-size: 16px; color: #666;")
+        loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.loading_progress = QProgressBar()
+        self.loading_progress.setRange(0, 0)
+        self.loading_progress.setMaximumWidth(300)
+        loading_layout.addWidget(loading_label)
+        loading_layout.addWidget(self.loading_progress)
+        self.loading_widget.hide()
         
+        self.file_tree = QTreeWidget()
+        self.file_tree.setHeaderLabels(["名称", "类型", "大小"])
+        self.file_tree.setColumnWidth(0, 300)
+        self.file_tree.setColumnWidth(1, 100)
+        
+        active_layout.addWidget(self.loading_widget)
         active_layout.addWidget(self.file_tree)
         
         self.content_stack.addWidget(empty_state_widget)
@@ -152,7 +244,9 @@ class MainWindow(QMainWindow):
         
         row2_layout = QHBoxLayout()
         self.instruction_input = QLineEdit()
+        self.instruction_input.setText("类型 >> 年份")
         self.instruction_input.setPlaceholderText("在此输入指令...")
+        self.instruction_input.setToolTip("使用 '>>' 创建子文件夹。示例: 类型 >> 年份 >> 月份")
         self.instruction_input.setMinimumHeight(30)
         
         self.start_convert_btn = QPushButton("开始转换")
@@ -204,29 +298,83 @@ class MainWindow(QMainWindow):
         
         self.content_stack.setCurrentIndex(1)
         
-        index = self.file_model.setRootPath(folder_path)
-        self.file_tree.setRootIndex(index)
+        self.file_tree.clear()
+        self.file_tree.hide()
+        self.loading_widget.show()
+        
+        if self.loader_worker and self.loader_worker.isRunning():
+            self.loader_worker.stop()
+            self.loader_worker.wait()
+        
+        self.loader_worker = TreeLoaderWorker(folder_path, WHITELIST_EXTENSIONS)
+        self.loader_worker.data_ready.connect(self.on_scan_finished)
+        self.loader_worker.start()
         
         self.start_counting(folder_path)
+    
+    def on_scan_finished(self, data):
+        self.loading_widget.hide()
+        self.file_tree.show()
+        
+        style = self.style()
+        folder_icon = style.standardIcon(style.StandardPixmap.SP_DirIcon)
+        file_icon = style.standardIcon(style.StandardPixmap.SP_FileIcon)
+        
+        self.populate_tree_from_data(data, self.file_tree, folder_icon, file_icon)
+    
+    def populate_tree_from_data(self, data, parent, folder_icon, file_icon):
+        for item_data in data:
+            if item_data['type'] == 'file':
+                tree_item = QTreeWidgetItem(parent)
+                tree_item.setText(0, item_data['name'])
+                tree_item.setText(1, item_data['extension'])
+                
+                size = item_data['size']
+                if size < 1024:
+                    size_str = f"{size} B"
+                elif size < 1024 * 1024:
+                    size_str = f"{size / 1024:.1f} KB"
+                else:
+                    size_str = f"{size / (1024 * 1024):.1f} MB"
+                tree_item.setText(2, size_str)
+                
+                tree_item.setIcon(0, file_icon)
+                tree_item.setData(0, Qt.ItemDataRole.UserRole, item_data['path'])
+            
+            elif item_data['type'] == 'dir':
+                tree_item = QTreeWidgetItem(parent)
+                tree_item.setText(0, item_data['name'])
+                tree_item.setText(1, "文件夹")
+                tree_item.setText(2, "")
+                tree_item.setIcon(0, folder_icon)
+                tree_item.setData(0, Qt.ItemDataRole.UserRole, item_data['path'])
+                
+                if 'children' in item_data and item_data['children']:
+                    self.populate_tree_from_data(item_data['children'], tree_item, folder_icon, file_icon)
     
     def start_counting(self, folder_path):
         if self.counter_thread and self.counter_thread.isRunning():
             self.counter_thread.stop()
             self.counter_thread.wait()
         
-        self.status_label.setText("正在统计...")
+        self.status_label.setText("正在扫描...")
         
-        self.counter_thread = FileCounterThread(folder_path)
+        self.counter_thread = FileCounterThread(folder_path, WHITELIST_EXTENSIONS)
         self.counter_thread.count_finished.connect(self.update_count)
         self.counter_thread.start()
     
     def update_count(self, folder_count, file_count):
-        self.status_label.setText(f"文件夹: {folder_count}  文件: {file_count}")
+        self.status_label.setText(f"扫描完成: {folder_count} 个文件夹, {file_count} 个支持的文件")
     
     def closeEvent(self, event):
+        if self.loader_worker and self.loader_worker.isRunning():
+            self.loader_worker.stop()
+            self.loader_worker.wait()
+        
         if self.counter_thread and self.counter_thread.isRunning():
             self.counter_thread.stop()
             self.counter_thread.wait()
+        
         event.accept()
 
 
